@@ -133,174 +133,193 @@
 
 
 
+# this uses the isaacsim conda environment
+# run_simulation.py — async preemption with LEFT_ACTION_THRESHOLD, dedup+no-skip
 
+from __future__ import annotations
 
+import os
+import time
+import threading
+import hashlib
+from typing import Dict, List, Optional, Tuple
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# this uses the issacsim conda environment
+import cv2
+import numpy as np
+import requests
 
 from isaacsim import SimulationApp
 
-# ==== 시뮬 파라미터 ====
-EPISODE_NUM = 1
-EACH_EPISODE_LEN = 600
-RESULT_VIDEO_FILE = "./results/NutPouring_batch32_600a1.mp4"
+# ---- User params ----
+EPISODE_NUM = 2
+EACH_EPISODE_LEN = 480
+RESULT_VIDEO_FILE = "./results/NutPouring_zttt11_33.mp4"
 LOAD_WORLD_FILE = "./sim_environments/gr1_NutPouring.usd"
 
-TASK = "Pick up the red beaker and tilt it to pour out 1 green nut into yellow bowl. Pick up the yellow bowl and place it on the metallic measuring scale."
+TASK = (
+    "Pick up the red beaker and tilt it to pour out 1 green nut into yellow bowl. "
+    "Pick up the yellow bowl and place it on the metallic measuring scale."
+)
 
-# 카메라 설정
-CAMERA_HEIGHT = 200  # width는 256 고정
+CAMERA_HEIGHT = 200
 CAMERA_FOCAL_LENGTH = 1.2
 CAMERA_FORWARD_DIST = 0.25
 CAMERA_ANGLE = 70
 
-INFERENCE_SERVER_URL = "http://localhost:9876/inference"
+SERVER = "http://localhost:9876"  # server must expose POST /inference
+ENV_FPS = 30.0
+ENV_DT = 1.0 / ENV_FPS
 
-# ==== 비동기 동작 파라미터 ====
-CHUNK_SIZE_THRESHOLD = 0.1   # 큐 크기 / 청크 크기 <= 임계치일 때 다음 옵저베이션 전송
-AGGREGATE_MODE = "latest_only"  # "latest_only" | "average" | "weighted_average" | "conservative"
+# ---- Action log path (mp4 -> txt) ----
+_log_base, _ = os.path.splitext(RESULT_VIDEO_FILE)
+ACTION_LOG_FILE = f"{_log_base}.txt"
 
-simulation_app = SimulationApp({
-    "headless": True,
-    "create_new_stage": False,
-    "open_usd": LOAD_WORLD_FILE,
-    "sync_loads": True,
-})
+# ---- Async policy knob ----
+LEFT_ACTION_THRESHOLD = 11 
+
+# ---- Isaac Sim init ----
+simulation_app = SimulationApp(
+    {
+        "headless": True,
+        "create_new_stage": False,
+        "open_usd": LOAD_WORLD_FILE,
+        "sync_loads": True,
+    }
+)
 
 from isaacsim.core.api import World
 from isaacsim.core.api.scenes.scene import Scene
 from isaacsim.core.api.robots import Robot
 from isaacsim.core.api.controllers.articulation_controller import ArticulationController
 from isaacsim.sensors.camera.camera import Camera
-import numpy as np
 import isaacsim.core.utils.numpy.rotations as rot_utils
 from isaacsim.core.utils.types import ArticulationAction
-import cv2
-import threading
-import time
-from queue import Queue, Empty
-from dataclasses import dataclass
 
-import gr1_config
-import gr1_gr00t_utils as utils
+import gr1_config  # 반드시 gr00t_joints_index를 제공
+import gr1_gr00t_utils as gutils  # make_gr00t_input
 
+# -------------------- HTTP helper --------------------
+def post_json(path: str, payload: dict, timeout: float = 10.0) -> dict:
+    r = requests.post(f"{SERVER}{path}", json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-# ------------------ Data structures ------------------
-@dataclass
-class ObsPackage:
-    task: str
-    image_rgb: np.ndarray        # (H, W=256, 3) uint8
-    joint_positions: np.ndarray  # (54,)
-    latest_timestep: int
-    ts: float
+# -------------------- Actions utilities --------------------
+def _infer_chunk_size(actions_dict: Dict[str, List[List[float]]]) -> int:
+    if not actions_dict:
+        return 0
+    any_key = next(iter(actions_dict.keys()))
+    arr = np.asarray(actions_dict[any_key], dtype=float)
+    return int(arr.shape[0]) if arr.ndim >= 1 else 0
 
-
-# ------------------ Async Client State ------------------
-class AsyncClientState:
-    def __init__(self):
-        self.action_queue: Queue[utils.TimedAction] = Queue()
-        self.action_queue_lock = threading.Lock()
-        self.latest_timestep = -1
-        self.action_chunk_size = 0
-        self.shutdown = threading.Event()
-        self.must_go = threading.Event()
-        self.must_go.set()  # 처음엔 반드시 보냄
-
-        # 메인→백그라운드로 관측 전달용 (메인만 카메라/월드 접근)
-        self.obs_queue: Queue[ObsPackage] = Queue(maxsize=1)
-
-    def actions_available(self) -> bool:
-        with self.action_queue_lock:
-            return not self.action_queue.empty()
-
-    def queue_size(self) -> int:
-        with self.action_queue_lock:
-            return self.action_queue.qsize()
-
-    def pop_action(self) -> utils.TimedAction | None:
-        with self.action_queue_lock:
-            if self.action_queue.empty():
-                return None
-            return self.action_queue.get_nowait()
-
-    def push_actions(self, actions: list[utils.TimedAction]):
-        with self.action_queue_lock:
-            # 동일 timestep이 이미 있으면 aggregate
-            existing = {a.timestep: a for a in list(self.action_queue.queue)}
-            new_queue = Queue()
-            for a in actions:
-                if a.timestep <= self.latest_timestep:
-                    continue
-                if a.timestep in existing:
-                    merged = utils.aggregate_actions(existing[a.timestep].action, a.action, mode=AGGREGATE_MODE)
-                    new_queue.put(utils.TimedAction(a.timestamp, a.timestep, merged))
-                else:
-                    new_queue.put(a)
-            self.action_queue = new_queue
-
-
-# ------------------ Receiver thread (no world/camera access here) ------------------
-def action_receiver_thread_fn(state: AsyncClientState):
-    """
-    - 메인 쓰레드가 obs_queue에 넣어준 관측 패키지를 받아
-    - HTTP inference 요청 → 액션 청크를 TimedAction 리스트로 변환하여 action_queue에 적재
-    """
-    while not state.shutdown.is_set():
-        try:
-            obs_pkg: ObsPackage = state.obs_queue.get(timeout=0.05)
-        except Empty:
+def actions_dict_to_joint_positions(
+    actions_dict: Dict[str, List[List[float]]],
+    t: int,
+    full_dof: int,
+) -> np.ndarray:
+    jp = np.zeros((full_dof,), dtype=float)
+    for part, idxs in gr1_config.gr00t_joints_index.items():
+        key = f"action.{part}"
+        arr = actions_dict.get(key)
+        target_len = len(idxs)
+        if arr is None:
             continue
+        arr_np = np.asarray(arr, dtype=float)
+        if arr_np.ndim == 1:
+            arr_np = arr_np[None, :]
+        if not (0 <= t < arr_np.shape[0]):
+            continue
+        vec = arr_np[t]
+        d_part = int(vec.shape[0])
+        if d_part == target_len:
+            jp[idxs] = vec
+        elif d_part > target_len:
+            jp[idxs] = vec[:target_len]
+        else:
+            padded = np.zeros((target_len,), dtype=float)
+            padded[:d_part] = vec
+            jp[idxs] = padded
+    return jp
+
+def small_hash_for_chunk(actions_dict: Dict[str, List[List[float]]], take: int = 4) -> str:
+    """Chunk identity for dedup: hash of first `take` timesteps of concatenated parts."""
+    if not actions_dict:
+        return "empty"
+    parts = []
+    for part in sorted(gr1_config.gr00t_joints_index.keys()):
+        key = f"action.{part}"
+        arr = np.asarray(actions_dict.get(key, []), dtype=float)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        head = arr[:take].astype(np.float32).tobytes()
+        parts.append(head)
+    return hashlib.sha1(b"".join(parts)).hexdigest()
+
+# -------------------- Async next-chunk fetcher --------------------
+class NextChunkFetcher:
+    """
+    Background fetch of next chunk via /inference.
+    Stores the cursor 'H_at_start' and 'global_timestep_at_start' when the request was launched.
+    The caller computes s = clamp(global_now - global_at_start, 0, next_K-1) at switch time.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ready = False
+        self._resp: Optional[dict] = None
+        self._hash: Optional[str] = None
+        self._H_at_start: int = 0
+        self._global_timestep_at_start: int = 0 # [ADDED]
+        self._thread: Optional[threading.Thread] = None
+
+    def in_flight(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, payload: dict, H_at_start: int, global_timestep_at_start: int): # [MODIFIED]
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._ready = False
+            self._resp = None
+            self._hash = None
+            self._H_at_start = int(H_at_start)
+            self._global_timestep_at_start = int(global_timestep_at_start) # [ADDED]
+            self._thread = threading.Thread(target=self._run, args=(payload,), daemon=True)
+            self._thread.start()
+
+    def _run(self, payload: dict):
         try:
-            payload = utils.make_gr00t_input(
-                task=obs_pkg.task, obs=obs_pkg.image_rgb, joint_positions=obs_pkg.joint_positions
-            )
-            t0 = time.time()
-            resp = utils.request_gr00t_inference(payload, url=INFERENCE_SERVER_URL)
-            actions_json = resp.get("actions", {})
-            chunk_size = int(resp.get("chunk_size", 0)) or 1
-            state.action_chunk_size = max(state.action_chunk_size, chunk_size)
-
-            chunk_arrays = utils.parse_actions_json_to_chunk(actions_json)
-            timed_actions = utils.make_timed_chunk(
-                chunk_arrays, start_ts=t0, start_timestep=obs_pkg.latest_timestep
-            )
-            state.push_actions(timed_actions)
-            state.must_go.set()  # 큐가 비면 다음 관측은 must-go
+            resp = post_json("/inference", payload)
+            actions = resp.get("actions", resp)
+            self_hash = small_hash_for_chunk(actions)
         except Exception as e:
-            print(f"[Receiver] Error: {e}")
-            time.sleep(0.05)
+            print("[WARN] /inference async fetch failed:", repr(e))
+            return
+        with self._lock:
+            self._resp = resp
+            self._hash = self_hash
+            self._ready = True
 
+    def take_if_ready(self) -> Tuple[Optional[dict], Optional[str], Optional[int], Optional[int]]: # [MODIFIED]
+        with self._lock:
+            if not self._ready or self._resp is None:
+                return None, None, None, None
+            resp = self._resp
+            h = self._hash
+            Hs = self._H_at_start
+            Gs = self._global_timestep_at_start 
+            # reset
+            self._resp = None
+            self._hash = None
+            self._ready = False
+            return resp, h, Hs, Gs 
 
+# -------------------- Main --------------------
 def main():
-    # 1) 씬/로봇/카메라 설정 (메인 쓰레드 전용)
     print("## 1. setup scene")
     world = World()
     scene: Scene = world.scene
     gr1: Robot = scene.add(Robot(prim_path="/World/gr1", name="gr1"))
-    controller: ArticulationController = gr1.get_articulation_controller()
+    ctrl: ArticulationController = gr1.get_articulation_controller()
 
     camera = Camera(
         prim_path="/World/gr1/head_yaw_link/camera",
@@ -313,82 +332,196 @@ def main():
     camera.set_focal_length(CAMERA_FOCAL_LENGTH)
     camera.set_clipping_range(0.1, 2)
 
-    # 2) 초기화 (메인)
-    world.reset()
     print("## 2. setup post-load")
+    world.reset()
     camera.initialize()
     camera.add_motion_vectors_to_frame()
-    controller.set_gains(kps=np.array([3000.0] * 54), kds=np.array([100.0] * 54))
 
-    # 3) 비디오 초기화 (메인)
+    dof = len(gr1.get_joint_positions())
+    ctrl.set_gains(kps=np.full((dof,), 3000.0), kds=np.full((dof,), 100.0))
+
     fourcc = cv2.VideoWriter_fourcc(*"MP4V")
     video = cv2.VideoWriter(RESULT_VIDEO_FILE, fourcc, 30, (256, CAMERA_HEIGHT), isColor=True)
 
-    state = AsyncClientState()
-
-    # 백그라운드 스레드 시작 (월드/카메라 접근 X)
-    receiver_th = threading.Thread(target=action_receiver_thread_fn, args=(state,), daemon=True)
-    receiver_th.start()
+    # ---- init/clear action log file ----
+    with open(ACTION_LOG_FILE, "w", encoding="utf-8") as logf:
+        logf.write("# action log aligned with video frames\n")
+        logf.write("# format: 'ep <ep> frame <frame_idx> chunk <chunk_id> (h:<hash4>) action <t> (gt:<g_step>)'\n")
 
     for ep in range(EPISODE_NUM):
         print(f"Starting episode {ep}")
         world.reset()
         gr1.set_joint_positions(positions=gr1_config.default_joint_position)
-
-        # 안정화 워밍업 (메인에서만 step)
-        for _ in range(60):
+        for _ in range(100):
             world.step(render=True)
 
-        steps = 0
-        while steps < EACH_EPISODE_LEN:
-            loop_start = time.perf_counter()
+        fetcher = NextChunkFetcher()  # 에피소드마다 초기화 (잔여 응답 carry-over 방지)
 
-            # (1) 큐에서 액션 하나를 꺼내 적용 (메인)
-            act = state.pop_action()
-            if act is not None:
-                controller.apply_action(ArticulationAction(joint_positions=act.action))
-                state.latest_timestep = max(state.latest_timestep, act.timestep)
+        # 0) 첫 청크 동기 수급
+        obs_rgba = camera.get_rgba()
+        img = obs_rgba[:, :, :3]
+        joints = gr1.get_joint_positions()
+        payload = gutils.make_gr00t_input(task=TASK, obs=img, joint_positions=joints)
+        resp = post_json("/inference", payload)
+        current_actions = resp.get("actions", resp)
+        current_K = int(resp.get("chunk_size", 0)) or _infer_chunk_size(current_actions)
+        current_hash = small_hash_for_chunk(current_actions)
 
-            # (2) 시뮬 스텝 + 센서 캡처 + 비디오 기록 (모두 메인)
+        # 현재 청크 state
+        chunk_id = 0
+        t_cursor = 0
+        global_action_timestep = 0 # Global step counter for actions
+        started_async_this_chunk = False
+
+        # 미리 받아둔 다음 청크 (staged)
+        staged_resp: Optional[dict] = None
+        staged_hash: Optional[str] = None
+        staged_K: int = 0
+        staged_H_at_start: int = 0
+        staged_global_timestep_at_start: int = 0 
+
+        frames = 0
+        while frames < EACH_EPISODE_LEN:
+            frame_start = time.perf_counter()
+
+            # A) 남은 액션이 THRESHOLD 이하면 다음 청크 비동기 인퍼런스 시작
+            remaining_in_chunk = current_K - t_cursor
+            if (remaining_in_chunk <= LEFT_ACTION_THRESHOLD) and (not started_async_this_chunk) and (not fetcher.in_flight()) and (staged_resp is None):
+                obs_rgba = camera.get_rgba()
+                img = obs_rgba[:, :, :3]
+                joints = gr1.get_joint_positions()
+                fetcher.start(
+                    gutils.make_gr00t_input(task=TASK, obs=img, joint_positions=joints),
+                    H_at_start=t_cursor,
+                    global_timestep_at_start=global_action_timestep # Pass global step
+                )
+                started_async_this_chunk = True
+                print(f"[PREFETCH] Triggered at t={t_cursor} (K={current_K}), Gs={global_action_timestep}. Remaining={remaining_in_chunk}")
+
+
+            # B) 프리패치 수신 시 staged 버퍼에 적재
+            r, h, Hs, Gs = fetcher.take_if_ready() 
+            if r is not None and h is not None:
+                # 현재 청크와 동일한 해시면 무시 (중복 응답 방지)
+                if h != current_hash:
+                    staged_resp = r
+                    staged_hash = h
+                    actions = r.get("actions", r)
+                    staged_K = int(r.get("chunk_size", 0)) or _infer_chunk_size(actions)
+                    staged_H_at_start = int(Hs)
+                    staged_global_timestep_at_start = int(Gs) 
+                    print(f"[PREFETCH] Staged chunk (h:{h[:4]}, K={staged_K}) from H={staged_H_at_start}, Gs={staged_global_timestep_at_start}")
+
+            # C) 프리엠션 조건: staged 가 있고, 지금 스위치해도 되는 상황이면 즉시 스위치
+            if staged_resp is not None and staged_hash is not None and staged_hash != current_hash:
+                # [FIXED] 's' 계산: (현재 글로벌 스텝 - 요청 시점 글로벌 스텝)
+                steps_passed_since_launch = global_action_timestep - staged_global_timestep_at_start
+                s = max(0, min(steps_passed_since_launch, staged_K - 1))
+                
+                # 스위치 수행
+                print(f"[PREEMPT] Chunk {chunk_id} (h:{current_hash[:4]}) -> {chunk_id+1} (h:{staged_hash[:4]})...")
+                print(f"[PREEMPT] ... Gs_at_start={staged_global_timestep_at_start}, Gs_now={global_action_timestep}. Offset s={s} (K_new={staged_K})")
+
+                chunk_id += 1
+                current_actions = staged_resp.get("actions", staged_resp)
+                current_K = staged_K
+                current_hash = staged_hash
+                t_cursor = s  # 새 청크의 s부터 시작
+                started_async_this_chunk = False
+                staged_resp = None
+                staged_hash = None
+                staged_K = 0
+                staged_H_at_start = 0
+                staged_global_timestep_at_start = 0
+
+            # D) 현재 청크에서 정확히 한 액션 적용
+            if 0 <= t_cursor < current_K:
+
+                jp = actions_dict_to_joint_positions(current_actions, t_cursor, full_dof=dof)
+                jp = jp[:dof]
+                ctrl.apply_action(ArticulationAction(joint_positions=jp))
+
+                short_h = current_hash[:4] if current_hash else "none"
+                with open(ACTION_LOG_FILE, "a", encoding="utf-8") as logf:
+                    logf.write(f"ep {ep} frame {frames} chunk {chunk_id} (h:{short_h}) action {t_cursor} (gt:{global_action_timestep})\n")
+
+                t_cursor += 1
+                global_action_timestep += 1 # Increment global step only on success
+            
+            else:
+                # E) 청크 소진: prefetch가 있으면 그걸로, 없으면 동기 요청
+                if staged_resp is not None and staged_hash is not None and staged_hash != current_hash:
+                    # 스테이지된 청크 채택
+                    # [FIXED] 's' 계산: (현재 글로벌 스텝 - 요청 시점 글로벌 스텝)
+                    steps_passed_since_launch = global_action_timestep - staged_global_timestep_at_start
+                    s = max(0, min(steps_passed_since_launch, staged_K - 1))
+
+                    print(f"[EXHAUST] Chunk {chunk_id} (h:{current_hash[:4]}) -> {chunk_id+1} (h:{staged_hash[:4]})...")
+                    print(f"[EXHAUST] ... Gs_at_start={staged_global_timestep_at_start}, Gs_now={global_action_timestep}. Offset s={s} (K_new={staged_K})")
+
+                    chunk_id += 1
+                    current_actions = staged_resp.get("actions", staged_resp)
+                    current_K = staged_K
+                    current_hash = staged_hash
+                    t_cursor = s
+                    started_async_this_chunk = False
+                    staged_resp = None
+                    staged_hash = None
+                    staged_K = 0
+                    staged_H_at_start = 0
+                    staged_global_timestep_at_start = 0
+                else:
+                    # 동기 새 청크
+                    print(f"[SYNC] Chunk {chunk_id} (h:{current_hash[:4]}) exhausted. Fetching new...")
+                    obs_rgba = camera.get_rgba()
+                    img = obs_rgba[:, :, :3]
+                    joints = gr1.get_joint_positions()
+                    next_resp = post_json("/inference", gutils.make_gr00t_input(task=TASK, obs=img, joint_positions=joints))
+                    next_actions = next_resp.get("actions", next_resp)
+                    next_K = int(next_resp.get("chunk_size", 0)) or _infer_chunk_size(next_actions)
+                    next_hash = small_hash_for_chunk(next_actions)
+
+                    # 동일 해시면(중복) 바로 버리고 다시 요청 (무한루프 방지: 1회만 재시도)
+                    if next_hash == current_hash:
+                        print(f"[WARN] Got duplicate hash {next_hash[:4]}. Re-fetching...")
+                        try:
+                            next_resp2 = post_json("/inference", gutils.make_gr00t_input(task=TASK, obs=img, joint_positions=joints))
+                            next_actions2 = next_resp2.get("actions", next_resp2)
+                            next_K2 = int(next_resp2.get("chunk_size", 0)) or _infer_chunk_size(next_actions2)
+                            next_hash2 = small_hash_for_chunk(next_actions2)
+                            if next_hash2 != current_hash:
+                                next_actions, next_K, next_hash = next_actions2, next_K2, next_hash2
+                        except Exception as e:
+                            print("[WARN] sync re-fetch failed:", repr(e))
+
+                    if next_hash != current_hash:
+                        chunk_id += 1
+                        current_actions = next_actions
+                        current_K = next_K
+                        current_hash = next_hash
+                        t_cursor = 0
+                        started_async_this_chunk = False
+                    else:
+                        # 정말 동일 청크가 반복되면(서버 정지/캐시), 안전하게 idle 1프레임 대기
+                        print(f"[WARN] Duplicate hash {next_hash[:4]} persists. Idling 1 frame.")
+                        time.sleep(ENV_DT)
+
+            # F) 렌더/비디오 기록
             world.step(render=True)
             obs_rgba = camera.get_rgba()
-            img = obs_rgba[:, :, :3].astype(np.uint8)
+            img = obs_rgba[:, :, :3]
             video.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
-            # (3) 임계치 기반 관측 전송 트리거 (메인→백그라운드 큐)
-            qsz = state.queue_size()
-            chunk_size = max(1, state.action_chunk_size)
-            ready_to_send = (qsz / chunk_size) <= CHUNK_SIZE_THRESHOLD
-            if (ready_to_send or (state.must_go.is_set() and qsz == 0)) and state.obs_queue.empty():
-                try:
-                    obs_pkg = ObsPackage(
-                        task=TASK,
-                        image_rgb=img,  # 메인에서 캡처한 이미지 복사/전달
-                        joint_positions=gr1.get_joint_positions(),
-                        latest_timestep=state.latest_timestep,
-                        ts=time.time(),
-                    )
-                    state.obs_queue.put_nowait(obs_pkg)
-                    state.must_go.clear()  # 전송했으니 must_go 클리어; 큐가 비면 receiver가 다시 set
-                except Exception:
-                    pass  # obs_queue가 가득이면 다음 루프로
-
-            # (4) 한 스텝 종료 처리
-            steps += 1
-
-            # busy 루프 방지 슬립
-            elapsed = time.perf_counter() - loop_start
-            time.sleep(max(0.0, 0.001 - elapsed))
+            # pacing
+            frames += 1
+            dt = time.perf_counter() - frame_start
+            time.sleep(max(0.0, ENV_DT - dt))
 
         print(f"Episode {ep} finished")
 
-    # 종료 처리
-    state.shutdown.set()
-    receiver_th.join(timeout=2.0)
     video.release()
     simulation_app.close()
-
+    print(f"[INFO] action log saved to: {ACTION_LOG_FILE}")
 
 if __name__ == "__main__":
     main()
-
