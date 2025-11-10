@@ -99,11 +99,6 @@ TUTORIAL_DIR = THIS_FILE.parent                    # .../Isaac-Sim-with-Gr00t-Tu
 REPO_ROOT = TUTORIAL_DIR.parent                    # .../Isaac-GR00T
 sys.path.insert(0, str(REPO_ROOT))
 
-# # (optional) coderun_reg 쪽도 있으면 우선순위 주고 싶을 때
-# REG_ROOT = REPO_ROOT.parent / "coderun_reg" / "Isaac-GR00T"
-# if REG_ROOT.exists():
-#     sys.path.insert(0, str(REG_ROOT))
-
 print("[server] sys.path[:5] =", sys.path[:5])
 
 import gr00t
